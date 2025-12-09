@@ -5,7 +5,7 @@ from neo4j import GraphDatabase
 from openai import OpenAI
 from string import Template
 
-GRAPH_TAG = "kg-label-v1"
+GRAPH_TAG = "kg-gold-v1" # les exercises "gold standard" vont être tagué par kg-gold-v1, et les autres noeuds en "kg-label-v1"
 NEO4J_DB = "neo4j"
 
 # ========================= 1. CONFIGURATION & DESIGN =========================
@@ -119,15 +119,21 @@ INJURY_KEYS = [
     "Épaules",
     "Hanches",
     "Cou / Cervicales",
+    "Chevilles / Pieds",
+    "Poignets / Avant-bras",
+    "Hernie discale / Rachis",
     "Aucune",
 ]
 
 INJURY_MAP = {
-    "Mal de dos (Lombaires)": ["spine", "lumbar", "vertebrae", "erector", "back"],
-    "Genoux": ["knee", "patella", "meniscus"],
-    "Épaules": ["rotator", "shoulder", "deltoid"],
-    "Hanches": ["hip", "gluteus", "pelvis", "piriformis"],
-    "Cou / Cervicales": ["cervical", "neck", "trapezius"],
+    "Mal de dos (Lombaires)": ["spine", "lumbar", "vertebrae", "erector", "lower back", "bas du dos"],
+    "Genoux": ["knee", "patella", "meniscus", "genou"],
+    "Épaules": ["rotator", "shoulder", "deltoid", "épaule"],
+    "Hanches": ["hip", "gluteus", "pelvis", "piriformis", "hanche"],
+    "Cou / Cervicales": ["cervical", "neck", "trapezius", "cou"],
+    "Chevilles / Pieds": ["ankle", "foot", "feet", "cheville", "pied"],
+    "Poignets / Avant-bras": ["wrist", "forearm", "poignet", "avant-bras"],
+    "Hernie discale / Rachis": ["herniated", "hernie", "sciatica", "sciatique", "disc", "discale", "rachis", "colonne"],
     "Aucune": [],
 }
 
@@ -182,11 +188,17 @@ def extract_profile_from_text(bio_text: str):
     client = get_openai_client()
 
     system_msg = (
-        "Tu es un Analyste de Données Sportives. "
-        "Tu lis le texte d'un client et tu en extrais des informations structurées. "
-        "Tu renvoies UNIQUEMENT du JSON valide avec les champs : 'equipment', 'injuries', 'goals', "
-        "chacun étant une liste de chaînes."
-    )
+    "Tu es un Analyste de Données Sportives. "
+    "Tu lis le texte d'un client et tu en extrais des informations structurées. "
+    "Tu renvoies UNIQUEMENT du JSON valide avec les champs : 'equipment', 'injuries', 'goals', "
+    "chacun étant une liste de chaînes.\n\n"
+    "IMPORTANT :\n"
+    "- Tu dois utiliser uniquement ces valeurs pour 'injuries' : "
+    f"{', '.join(INJURY_KEYS)}.\n"
+    "- Si la personne mentionne une douleur ou blessure (ex: cheville, pied, poignet, hernie, sciatique, etc.), "
+    "tu DOIS choisir au moins une entrée autre que 'Aucune'.\n"
+    "- 'Aucune' ne doit être renvoyé que si VRAIMENT aucune douleur/blessure n'est mentionnée.\n"
+)
 
     user_msg = f"""
 TEXTE UTILISATEUR : "{bio_text}"
@@ -196,9 +208,15 @@ TEXTE UTILISATEUR : "{bio_text}"
    - Si l'utilisateur dit 'salle de sport', mets tous les éléments disponibles : {', '.join(EQUIPMENT_KEYS)}.
 
 2. BLESSURES (Liste exacte parmi : {', '.join(INJURY_KEYS)}).
-   - Si aucune mention, mets ["Aucune"].
+   - Exemples :
+     * "hernie discale" -> ["Hernie discale / Rachis"]
+     * "mal à la cheville", "pied fragile" -> ["Chevilles / Pieds"]
+     * "douleur au poignet" -> ["Poignets / Avant-bras"]
+   - Si AUCUNE douleur n'est mentionnée, mets ["Aucune"]. Ne mets jamais 'Aucune' si une douleur est citée.
 
-3. OBJECTIFS (Synthèse courte sous forme de quelques mots, ex: "Perte de gras", "Prise de muscle", "Mobilité", etc.).
+3. OBJECTIFS :
+   - Synthétise les objectifs de la personne en quelques étiquettes courtes, par ex :
+     "Perte de gras", "Prise de muscle", "Cardio", "Santé générale", "Perf. force", etc.
    - Mets ces objectifs dans une liste de chaînes, ex: ["Perte de gras", "Renforcement dos"].
 
 RENVOIE UNIQUEMENT DU JSON AVEC :
@@ -236,7 +254,7 @@ RENVOIE UNIQUEMENT DU JSON AVEC :
 
 def get_safe_exercises(profile: dict, context: dict):
     """
-    Interroge Neo4j pour trouver les exercices compatibles ET leurs vidéos.
+    Interroge Neo4j pour trouver les exercices compatibles ET leurs vidéos + images.
     Filtré par matériel + zones à éviter (blessures + douleurs du jour).
     """
     driver = get_neo4j_driver()
@@ -258,7 +276,11 @@ def get_safe_exercises(profile: dict, context: dict):
           MATCH (e)-[:TARGETS]->(b:BodyPart)
           WHERE any(term IN $banned_terms WHERE toLower(b.name) CONTAINS term)
       }
-    RETURN DISTINCT e.name AS name, e.video AS video
+    RETURN DISTINCT
+      e.name       AS name,
+      e.name_fr    AS name_fr,
+      e.video      AS video,
+      e.image_url  AS image_url
     LIMIT 40
     """
 
@@ -272,11 +294,18 @@ def get_safe_exercises(profile: dict, context: dict):
                     "graph_tag": GRAPH_TAG,
                 },
             )
-            return [{"name": r["name"], "video": r["video"]} for r in res]
+            return [
+                {
+                    "name": r["name"],          # anglais
+                    "name_fr": r["name_fr"],    # français (peut être None)
+                    "video": r["video"],
+                    "image_url": r["image_url"],  # <--- cohérent avec le reste du code
+                }
+                for r in res
+            ]
     except Exception as e:
         st.error(f"Erreur Neo4j : {e}")
         return []
-
 
 def generate_session_with_llm(profile: dict, context: dict, valid_exercises: list, last_feedback: dict | None):
     """
@@ -295,6 +324,7 @@ def generate_session_with_llm(profile: dict, context: dict, valid_exercises: lis
       - sets (int ou null)
       - reps (string ou null)
       - duration_min (int ou null)
+      - rest_sec (int ou null)
       - video (string ou null)
       - instruction (string)
     """
@@ -308,12 +338,33 @@ def generate_session_with_llm(profile: dict, context: dict, valid_exercises: lis
     feedback_json = last_feedback or {}
 
     system_msg = (
-        "Tu es un coach sportif d'élite. "
-        "Tu construis des séances personnalisées basées sur des exercices sécurisés fournis. "
-        "Tu dois impérativement renvoyer UNIQUEMENT du JSON valide (aucun texte autour) avec la structure suivante : "
-        "strategie (liste de phrases), seance.echauffement/corps/retour_calme (listes d'exercices), mot_fin (string). "
-        "Chaque exercice contient les clés : name, sets, reps, duration_min, video, instruction."
-    )
+    "Tu es un coach sportif d'élite. "
+    "Tu construis des séances personnalisées basées sur des exercices sécurisés fournis. "
+    "Ton cadre principal est la musculation (séances de renforcement, séries / reps classiques), "
+    "et non du CrossFit ou des WOD type AMRAP.\n"
+    "Tu dois impérativement renvoyer UNIQUEMENT du JSON valide avec la structure suivante :\n\n"
+    "{\n"
+    "  \"strategie\": [\"phrase1\", \"phrase2\"],\n"
+    "  \"seance\": {\n"
+    "     \"echauffement\": [ {...}, {...} ],\n"
+    "     \"corps\": [ {...}, {...}, ... ],\n"
+    "     \"retour_calme\": [ {...}, {...} ]\n"
+    "  },\n"
+    "  \"mot_fin\": \"...\"\n"
+    "}\n\n"
+    "Tu DOIS toujours remplir les trois parties :\n"
+    "- au moins 1 exercice dans \"echauffement\",\n"
+    "- au moins 1 exercice dans \"retour_calme\".\n"
+    "Ne mets jamais tous les exercices ensemble dans une seule liste.\n\n"
+    "Chaque exercice doit contenir exactement les clés : "
+    "name, sets, reps, duration_min, rest_sec, video, instruction.\n\n"
+    "Exemples d'exercices typiquement utilisés en échauffement : "
+    "Bodyweight Squat, Band Pull Apart, Arm Circles, Ankle Circles, etc. "
+    "Exemples d'exercices typiquement utilisés en retour au calme : étirements, mouvements de mobilité douce.\n\n"
+    "Quand les objectifs contiennent la prise de muscle, la force ou le renforcement, "
+    "la séance doit être présentée clairement comme une séance de musculation "
+    "(mentionne le mot 'musculation' dans 'strategie').\n"
+)
 
     user_msg = (
         "INFOS CLIENT :\n"
@@ -333,19 +384,21 @@ def generate_session_with_llm(profile: dict, context: dict, valid_exercises: lis
         f"{json.dumps(safe_exos_min, ensure_ascii=False)}\n\n"
         "TA MISSION :\n"
         "1. Construire une séance cohérente et sécurisée en 3 parties : échauffement, corps de séance, retour au calme.\n"
-        "2. Adapter l'intensité et le volume en fonction du niveau, de l'énergie du jour, des douleurs, du feedback précédent et du temps disponible.\n"
-        "3. Pour chaque exercice utilisé, le choisir dans la liste fournie et renvoyer un objet avec :\n"
+        "2. Adapter l'intensité ET le volume en fonction :\n"
+        "   - du niveau (Beginner / Intermediate / Advanced),\n"
+        "   - de l'énergie du jour (1 = très fatigué -> séance plus courte, moins de séries, repos plus longs ; "
+        "10 = énergie haute -> plus de volume, exercices plus durs),\n"
+        "   - du temps disponible (15 vs 90 minutes doivent donner un nombre d'exercices et de séries très différent),\n"
+        "   - des douleurs, du feedback précédent.\n"
+        "3. Pour chaque exercice utilisé, renvoyer un objet avec les clés suivantes :\n"
         "   - name (string)\n"
         "   - sets (int ou null)\n"
         "   - reps (string ou null)\n"
         "   - duration_min (int ou null)\n"
+        "   - rest_sec (int ou null, temps de repos en secondes entre les séries)\n"
         "   - video (string ou null)\n"
-        "   - instruction (string en français, clair et rassurant).\n\n"
-        "FORMAT DE RÉPONSE :\n"
-        "Renvoyer UNIQUEMENT du JSON avec les clés :\n"
-        "- strategie: liste de 2 à 4 phrases expliquant l'adaptation de la séance\n"
-        "- seance: objet avec les clés 'echauffement', 'corps', 'retour_calme' (chacune une liste d'exercices)\n"
-        "- mot_fin: une phrase courte de conclusion positive en français.\n"
+        "   - instruction (string en français, clair et rassurant).\n"
+        "4. Réponds UNIQUEMENT avec un JSON ayant les clés : strategie, seance, mot_fin.\n"
     )
 
     try:
@@ -360,6 +413,16 @@ def generate_session_with_llm(profile: dict, context: dict, valid_exercises: lis
         )
         content = resp.choices[0].message.content
         plan = json.loads(content)
+
+        # Normalisation des noms de clés de séance
+        if isinstance(plan, dict):
+            seance = plan.get("seance")
+            if isinstance(seance, dict):
+                if "corps" not in seance and "corps_de_seance" in seance:
+                    seance["corps"] = seance.pop("corps_de_seance")
+                if "retour_calme" not in seance and "retour_au_calme" in seance:
+                    seance["retour_calme"] = seance.pop("retour_au_calme")
+                plan["seance"] = seance
         return plan
     except Exception as e:
         st.error(f"Erreur lors de la génération de la séance IA : {e}")
@@ -676,22 +739,22 @@ def page_checkin():
 
     with st.form("checkin"):
         time_avail = st.slider(
-        "⏱ Temps disponible (minutes)",
-        min_value=15,
-        max_value=90,
-        step=5,
-        value=30,
-    )
+            "⏱ Temps disponible (minutes)",
+            min_value=15,
+            max_value=90,
+            step=5,
+            value=30,
+        )
         energy = st.slider("⚡️ Niveau d'énergie (1 = HS, 10 = On fire)", 1, 10, 6)
-        
+
         st.markdown("**Douleur spécifique aujourd'hui ?** (en plus de ton profil habituel)")
         daily_pain = st.multiselect("Zone", list(INJURY_MAP.keys()), default=["Aucune"])
-        
+
         note = st.text_input("Un message pour ton coach ? (mal dormi, stress, etc.)", value="")
-        
+
         submitted = st.form_submit_button("GÉNÉRER LE PROGRAMME")
         if submitted:
-            with st.spinner("Le Cerbère interroge le Graphe Scientifique..."):
+            with st.spinner("Création de votre programme en cours..."):
                 profile = st.session_state.user_profile
                 context = {
                     "time": time_avail,
@@ -699,7 +762,8 @@ def page_checkin():
                     "daily_pain": daily_pain,
                     "note": note,
                 }
-                
+
+                # 1) Récupération des exercices sûrs depuis Neo4j
                 safe_exos = get_safe_exercises(profile, context)
                 if not safe_exos:
                     st.error(
@@ -708,7 +772,20 @@ def page_checkin():
                         "➜ Essaie de réduire les zones de douleur ou d'ajouter du matériel."
                     )
                     return
-                
+
+                # 2) Sauvegarde des mappings utiles pour l'affichage
+                #    - nom EN -> nom FR
+                #    - nom EN -> URL de l'image
+                st.session_state.exercise_name_map = {
+                    ex["name"]: ex.get("name_fr")
+                    for ex in safe_exos
+                }
+                st.session_state.exercise_image_map = {
+                    ex["name"]: ex.get("image_url")
+                    for ex in safe_exos
+                }
+
+                # 3) Génération de la séance via le LLM
                 workout_plan = generate_session_with_llm(
                     profile,
                     context,
@@ -719,18 +796,38 @@ def page_checkin():
                     st.error("Impossible de générer la séance. Réessaie dans un instant.")
                     return
 
+                # 4) Stockage de la séance et routing
                 st.session_state.workout_plan = workout_plan
                 st.session_state.session_time = time_avail
                 st.session_state.page = "workout"
                 st.rerun()
 
-
 def render_exercise_card(ex: dict, section_key: str, idx: int):
-    """Affiche un exercice sous forme de 'carte' avec vidéo, détails, checkbox."""
-    name = ex.get("name", "Exercice")
+    """Affiche un exercice sous forme de 'carte' avec vidéo, image, détails, checkbox."""
+    name_en = ex.get("name", "Exercice")
+
+    # Récupération du nom français depuis le mapping en session
+    name_fr = None
+    name_map = st.session_state.get("exercise_name_map", {})
+    if isinstance(name_map, dict):
+        name_fr = name_map.get(name_en)
+
+    # 💡 Récupération de l'image depuis le mapping en session
+    image_url = None
+    image_map = st.session_state.get("exercise_image_map", {})
+    if isinstance(image_map, dict):
+        image_url = image_map.get(name_en)
+
+    # Affichage : Français (Anglais) si possible
+    if name_fr:
+        display_name = f"{name_fr} ({name_en})"
+    else:
+        display_name = name_en
+
     sets = ex.get("sets")
     reps = ex.get("reps")
     duration_min = ex.get("duration_min")
+    rest_sec = ex.get("rest_sec")
     video = ex.get("video")
     instruction = ex.get("instruction", "")
 
@@ -741,29 +838,39 @@ def render_exercise_card(ex: dict, section_key: str, idx: int):
         details.append(f"{sets} série(s)")
     if reps:
         details.append(f"{reps} reps")
+    if rest_sec:
+        details.append(f"Repos {rest_sec}s")
 
     detail_line = " • ".join(details) if details else "Durée / volume libre"
 
-    with st.expander(f"{name} — {detail_line}", expanded=False):
+    with st.expander(f"{display_name} — {detail_line}", expanded=False):
+
+        # 🔹 Affichage de l'image si disponible
+        if image_url:
+            st.image(
+                image_url,
+                caption="Exécution du mouvement",
+                use_container_width=True,
+            )
+
+        # 🔹 Affichage de la vidéo si disponible
         if video:
-            # Si c'est une URL de recherche YouTube -> on affiche un bouton
             if "youtube.com/results?search_query=" in video:
                 st.markdown(
                     f"[🔎 Voir les tutos pour cet exercice sur YouTube]({video})",
                     unsafe_allow_html=False,
                 )
             else:
-                # Sinon on tente de l'embarquer comme vraie vidéo
                 st.video(video)
 
         st.markdown(f"**Consigne :** {instruction}")
         st.checkbox("Fait ✅", key=f"done_{section_key}_{idx}")
 
-
 def page_workout():
     st.title("🏋️‍♂️ Ta Séance personnalisée")
 
     plan = st.session_state.workout_plan
+    st.expander("Debug – plan brut").json(plan)
 
     if plan is None:
         st.warning("Aucune séance en cours. Retour à l'accueil.")
@@ -839,8 +946,52 @@ def page_workout():
     if not isinstance(plan, dict):
         st.markdown(plan)
     else:
+        # --- Stratégie ---
         strategie = plan.get("strategie", [])
+        # Toujours une liste de phrases
+        if isinstance(strategie, str):
+            strategie = [strategie]
+        elif not isinstance(strategie, list):
+            strategie = []
+
+        # --- Normalisation robuste de la séance ---
         seance = plan.get("seance", {})
+
+        # 1) Si c'est une liste -> on considère que c'est le corps de séance
+        if isinstance(seance, list):
+            exos = seance
+            echauffement = []
+            corps = exos[:]
+            retour_calme = []
+
+            # Heuristique simple : premier exo = échauffement
+            if corps:
+                echauffement.append(corps.pop(0))
+
+            # Heuristique simple : si on a 5+ exos, dernier = retour au calme
+            if len(corps) >= 5:
+                retour_calme.append(corps.pop(-1))
+
+            seance = {
+                "echauffement": echauffement,
+                "corps": corps,
+                "retour_calme": retour_calme,
+            }
+        # 2) Si ce n'est ni une liste ni un dict -> on met une structure vide
+        elif not isinstance(seance, dict):
+            seance = {
+                "echauffement": [],
+                "corps": [],
+                "retour_calme": [],
+            }
+
+        # 3) Harmonisation des noms de clés (cas où le modèle renvoie en français)
+        if "corps" not in seance and "corps_de_seance" in seance:
+            seance["corps"] = seance["corps_de_seance"]
+        if "retour_calme" not in seance and "retour_au_calme" in seance:
+            seance["retour_calme"] = seance["retour_au_calme"]
+
+        # 4) Lecture finale
         echauffement = seance.get("echauffement", [])
         corps = seance.get("corps", [])
         retour_calme = seance.get("retour_calme", [])
